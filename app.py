@@ -10,8 +10,8 @@ from datetime import date
 # - Lookup is Excel with sheets:
 #   Generic, Family, Die, Package, Option, Packing
 # - Exact input column names (no candidates)
-# - Reject row if ANY required column is Blank or literal "N/A"
 # - Preserve "N/A" as string (not converted to NaN)
+# - Validate columns per-level (rows can be valid for some levels and not others)
 # - Map existing strings -> IDs
 # - Create new sequential IDs per level
 # - Append new rows to the relevant tab with RowFlag/RowDate/RunTag
@@ -121,13 +121,21 @@ def is_blank_or_na(x):
         return True
     return False
 
-def reject_rows(df: pd.DataFrame, required_cols):
-    invalid = pd.Series(False, index=df.index)
-    for c in required_cols:
-        invalid = invalid | df[c].astype(str).map(is_blank_or_na)
-    rejected = df[invalid].copy()
-    accepted = df[~invalid].copy()
-    return accepted, rejected
+
+def level_valid_mask(df: pd.DataFrame, level_key: str):
+    comps = LEVEL_TABS[level_key]["components"]
+    mask = pd.Series(True, index=df.index)
+    for c in comps:
+        mask = mask & (~df[c].astype(str).map(is_blank_or_na))
+    return mask
+
+
+def build_level_issue_table(df: pd.DataFrame):
+    issue = pd.DataFrame(index=df.index)
+    for level_key in LEVEL_TABS.keys():
+        issue[f"{level_key}_Valid"] = level_valid_mask(df, level_key)
+    issue["Any_Level_Valid"] = issue[[c for c in issue.columns if c.endswith("_Valid")]].any(axis=1)
+    return issue.reset_index().rename(columns={"index": "RowIndex"})
 
 # ----------------------------
 # 4) General helpers
@@ -242,7 +250,8 @@ def build_strings_from_input(df: pd.DataFrame):
     return out
 
 def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
-                         level_key: str, run_tag: str, prefix_override: str):
+                         level_key: str, run_tag: str, prefix_override: str,
+                         valid_mask: pd.Series):
     info = LEVEL_TABS[level_key]
     s_col = info["string_col"]
     i_col = info["id_col"]
@@ -264,68 +273,57 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
     # Infer ID format from existing IDs
     prefix, next_num, width = infer_id_format(existing[i_col], default_prefix)
 
-    # ======================================================
-    # 1) Build DISTINCT RELATIONS from input for this level
-    # ======================================================
-    # We take only the components + string for this level
+    # ---------------------------------------
+    # Build DISTINCT RELATIONS from VALID rows only
+    # ---------------------------------------
     rel_cols = comps + [s_col]
-    rel_df = enriched[rel_cols].copy()
+    rel_df = enriched.loc[valid_mask, rel_cols].copy()
 
     for c in comps:
         rel_df[c] = rel_df[c].apply(safe_str)
     rel_df[s_col] = rel_df[s_col].apply(safe_str)
 
-    # Drop empty strings (shouldn't happen often)
     rel_df = rel_df[rel_df[s_col] != ""].copy()
-
-    # Distinct relationships فقط
     rel_df = rel_df.drop_duplicates(subset=rel_cols, keep="first").reset_index(drop=True)
 
-    # ======================================================
-    # 2) Find truly new strings not in lookup
-    # ======================================================
-    rel_df["__exists__"] = rel_df[s_col].map(lambda x: x in mapping)
-    new_rel = rel_df[~rel_df["__exists__"]].copy()
+    # Find new strings
+    new_rel = rel_df[~rel_df[s_col].isin(mapping.keys())].copy()
 
     new_rows = []
     if not new_rel.empty:
-        # Generate new IDs for each new distinct relation
-        ids = []
+        new_ids = []
         for _ in range(len(new_rel)):
-            ids.append(format_id(prefix, next_num, width))
+            new_ids.append(format_id(prefix, next_num, width))
             next_num += 1
 
-        new_rel[i_col] = ids
+        new_rel[i_col] = new_ids
 
         # Update mapping
         for s, new_id in zip(new_rel[s_col].tolist(), new_rel[i_col].tolist()):
             mapping[s] = new_id
 
-        # Build lookup rows with original component cols
+        # Build new lookup rows with original comps
         for _, r in new_rel.iterrows():
             row = {c: "" for c in comps + [s_col, i_col] + META_COLS}
             for c in comps:
                 row[c] = r[c]
-
             row[s_col] = r[s_col]
             row[i_col] = r[i_col]
             row["RowFlag"] = "added"
             row["RowDate"] = TODAY_STR
             row["RunTag"]  = run_tag or ""
-
             new_rows.append(row)
 
-    # ======================================================
-    # 3) Append WITHOUT wiping tab duplicates
-    # ======================================================
     if new_rows:
-        add_df = pd.DataFrame(new_rows)
-        tab_df = pd.concat([tab_df, add_df], ignore_index=True)
+        tab_df = pd.concat([tab_df, pd.DataFrame(new_rows)], ignore_index=True)
 
-    # ======================================================
-    # 4) Map IDs back to all accepted rows
-    # ======================================================
-    enriched[i_col] = enriched[s_col].apply(safe_str).map(mapping).fillna("")
+    # ---------------------------------------
+    # Map IDs back to ALL rows:
+    # - If a row is invalid for this level => blank ID
+    # ---------------------------------------
+    enriched[i_col] = ""
+    valid_strings = enriched.loc[valid_mask, s_col].apply(safe_str)
+    enriched.loc[valid_mask, i_col] = valid_strings.map(mapping).fillna("")
 
     return enriched, tab_df, prefix, width, len(new_rows)
 
@@ -374,7 +372,7 @@ have these sheets only: **Generic, Family, Die, Package, Option, Packing**.
 
 Rules:
 - Uses your input columns **as-is**.
-- If any required field is **Blank** or **N/A**, the row is **rejected**.
+- Validity is checked per level using only that level's columns.
 - New strings get new sequential IDs per tab.
 - New lookup rows are stamped with **RowFlag/RowDate/RunTag**.
 """
@@ -468,12 +466,13 @@ if run:
             if missing:
                 raise KeyError("Missing required columns:\n- " + "\n- ".join(missing))
 
-            # Reject invalid rows
-            accepted, rejected = reject_rows(raw_df, REQUIRED_COLS)
-            st.session_state["rejected_rows"] = rejected
+            # Build strings on all rows (no global rejection)
+            enriched = build_strings_from_input(raw_df)
 
-            # Build strings on accepted only
-            enriched = build_strings_from_input(accepted)
+            # Build per-level validity table
+            issues = build_level_issue_table(raw_df)
+            st.session_state["issues_table"] = issues
+            st.session_state["rejected_rows"] = pd.DataFrame()
 
             # We'll update tabs copy
             updated_tabs = {}
@@ -483,12 +482,15 @@ if run:
             # Assign level by level
             for level_key in LEVEL_TABS.keys():
                 tab_df = lookup_tabs.get(level_key, pd.DataFrame())
+                issues = st.session_state["issues_table"].set_index("RowIndex")
+                valid_mask = issues[f"{level_key}_Valid"]
                 enriched, updated_tab, prefix, width, new_count = assign_ids_for_level(
                     enriched=enriched,
                     tab_df=tab_df,
                     level_key=level_key,
                     run_tag=run_tag,
-                    prefix_override=prefix_override.get(level_key)
+                    prefix_override=prefix_override.get(level_key),
+                    valid_mask=valid_mask
                 )
                 updated_tabs[level_key] = updated_tab
 
@@ -503,19 +505,16 @@ if run:
 
             st.success("Mapping complete.")
 
-            m1, m2, m3 = st.columns(3)
+            m1, m2 = st.columns(2)
             m1.metric("Raw rows", len(raw_df))
-            m2.metric("Accepted rows", len(enriched))
-            m3.metric("Rejected rows", len(rejected))
+            issues = st.session_state["issues_table"]
+            m2.metric("Rows valid for ANY level", int(issues["Any_Level_Valid"].sum()))
 
-            st.subheader("Enriched data preview (accepted rows only)")
+            st.subheader("Enriched data preview (all rows)")
             st.dataframe(enriched.head(100), use_container_width=True)
 
-            st.subheader("Rejected rows preview")
-            if rejected.empty:
-                st.info("No rejected rows.")
-            else:
-                st.dataframe(rejected.head(100), use_container_width=True)
+            st.subheader("Validity by level (first 50 rows)")
+            st.dataframe(issues.head(50), use_container_width=True)
 
             st.subheader("Updated lookup tab previews (tail 20)")
             cols = st.columns(3)
