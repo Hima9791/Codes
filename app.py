@@ -241,68 +241,94 @@ def build_strings_from_input(df: pd.DataFrame):
 
     return out
 
-def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame, level_key: str, run_tag: str, prefix_override: str):
+def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
+                         level_key: str, run_tag: str, prefix_override: str):
     info = LEVEL_TABS[level_key]
     s_col = info["string_col"]
     i_col = info["id_col"]
     comps = info["components"]
     default_prefix = prefix_override or info["prefix_default"]
 
+    # Ensure lookup tab schema
     tab_df = ensure_tab_columns(tab_df, level_key)
 
-    # Build mapping
+    # Normalize existing lookup
     tab_df[s_col] = tab_df[s_col].apply(safe_str)
     tab_df[i_col] = tab_df[i_col].apply(safe_str)
+
     existing = tab_df[tab_df[s_col] != ""].copy()
 
+    # Mapping from existing lookup
     mapping = dict(zip(existing[s_col], existing[i_col]))
+
+    # Infer ID format from existing IDs
     prefix, next_num, width = infer_id_format(existing[i_col], default_prefix)
 
-    # Assign for input rows
+    # ======================================================
+    # 1) Build DISTINCT RELATIONS from input for this level
+    # ======================================================
+    # We take only the components + string for this level
+    rel_cols = comps + [s_col]
+    rel_df = enriched[rel_cols].copy()
+
+    for c in comps:
+        rel_df[c] = rel_df[c].apply(safe_str)
+    rel_df[s_col] = rel_df[s_col].apply(safe_str)
+
+    # Drop empty strings (shouldn't happen often)
+    rel_df = rel_df[rel_df[s_col] != ""].copy()
+
+    # Distinct relationships فقط
+    rel_df = rel_df.drop_duplicates(subset=rel_cols, keep="first").reset_index(drop=True)
+
+    # ======================================================
+    # 2) Find truly new strings not in lookup
+    # ======================================================
+    rel_df["__exists__"] = rel_df[s_col].map(lambda x: x in mapping)
+    new_rel = rel_df[~rel_df["__exists__"]].copy()
+
     new_rows = []
-    out_ids = []
+    if not new_rel.empty:
+        # Generate new IDs for each new distinct relation
+        ids = []
+        for _ in range(len(new_rel)):
+            ids.append(format_id(prefix, next_num, width))
+            next_num += 1
 
-    for idx, row in enriched.iterrows():
-        s = safe_str(row.get(s_col, ""))
-        if s == "":
-            out_ids.append("")
-            continue
+        new_rel[i_col] = ids
 
-        if s in mapping:
-            out_ids.append(mapping[s])
-            continue
+        # Update mapping
+        for s, new_id in zip(new_rel[s_col].tolist(), new_rel[i_col].tolist()):
+            mapping[s] = new_id
 
-        # new ID
-        new_id = format_id(prefix, next_num, width)
-        next_num += 1
-        mapping[s] = new_id
-        out_ids.append(new_id)
+        # Build lookup rows with original component cols
+        for _, r in new_rel.iterrows():
+            row = {c: "" for c in comps + [s_col, i_col] + META_COLS}
+            for c in comps:
+                row[c] = r[c]
 
-        # build new lookup row (with original component cols)
-        new_lookup_row = {c: "" for c in comps + [s_col, i_col] + META_COLS}
-        for c in comps:
-            new_lookup_row[c] = safe_str(row.get(c, ""))
+            row[s_col] = r[s_col]
+            row[i_col] = r[i_col]
+            row["RowFlag"] = "added"
+            row["RowDate"] = TODAY_STR
+            row["RunTag"]  = run_tag or ""
 
-        new_lookup_row[s_col] = s
-        new_lookup_row[i_col] = new_id
-        new_lookup_row["RowFlag"] = "added"
-        new_lookup_row["RowDate"] = TODAY_STR
-        new_lookup_row["RunTag"]  = run_tag or ""
+            new_rows.append(row)
 
-        new_rows.append(new_lookup_row)
-
-    enriched[i_col] = out_ids
-
-    # Append deduped new rows to tab
+    # ======================================================
+    # 3) Append WITHOUT wiping tab duplicates
+    # ======================================================
     if new_rows:
         add_df = pd.DataFrame(new_rows)
         tab_df = pd.concat([tab_df, add_df], ignore_index=True)
 
-        # Dedup by string
-        tab_df[s_col] = tab_df[s_col].apply(safe_str)
-        tab_df = tab_df.drop_duplicates(subset=[s_col], keep="first").reset_index(drop=True)
+    # ======================================================
+    # 4) Map IDs back to all accepted rows
+    # ======================================================
+    enriched[i_col] = enriched[s_col].apply(safe_str).map(mapping).fillna("")
 
     return enriched, tab_df, prefix, width, len(new_rows)
+
 
 def to_excel_bytes_with_tabs(enriched_df, rejected_df, tabs_dict):
     bio = io.BytesIO()
