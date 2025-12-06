@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import io
 import re
-import requests
 from datetime import date
 
 # ============================================================
@@ -24,7 +23,7 @@ st.set_page_config(page_title="Hierarchy Lookup Builder (Tabs + Strict)", layout
 # ----------------------------
 # 0) Default config
 # ----------------------------
-DEFAULT_LOOKUP_URL = "https://raw.githubusercontent.com/<YOUR_USER>/<YOUR_REPO>/main/lookup_.xlsx"
+DEFAULT_LOOKUP_PATH = "lookup_.xlsx"
 TODAY_STR = date.today().isoformat()
 
 # ----------------------------
@@ -318,18 +317,20 @@ def to_excel_bytes_with_tabs(enriched_df, rejected_df, tabs_dict):
     bio.seek(0)
     return bio.getvalue()
 
-def load_lookup_from_github(url: str):
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    content = r.content
-    # Read all sheets
+def load_lookup_from_file(path: str):
+    with open(path, "rb") as f:
+        content = f.read()
     xls = pd.ExcelFile(io.BytesIO(content))
     sheets = {}
     for key in LEVEL_TABS.keys():
         sheet_name = LEVEL_TABS[key]["sheet"]
         if sheet_name in xls.sheet_names:
-            sheets[key] = pd.read_excel(xls, sheet_name=sheet_name,
-                                        keep_default_na=False, na_filter=False)
+            sheets[key] = pd.read_excel(
+                xls,
+                sheet_name=sheet_name,
+                keep_default_na=False,
+                na_filter=False,
+            )
         else:
             # Create empty sheet if missing
             sheets[key] = pd.DataFrame()
@@ -342,8 +343,8 @@ st.title("Hierarchy Lookup Builder (Tabs + Strict Rows)")
 
 st.markdown(
     """
-This app expects your **GitHub lookup Excel** to have these sheets only:
-**Generic, Family, Die, Package, Option, Packing**.
+This app reads the **local lookup_.xlsx** bundled with the app and expects it to
+have these sheets only: **Generic, Family, Die, Package, Option, Packing**.
 
 Rules:
 - Uses your input columns **as-is**.
@@ -355,7 +356,7 @@ Rules:
 
 with st.sidebar:
     st.header("Lookup Source")
-    lookup_url = st.text_input("GitHub RAW URL (lookup_.xlsx)", value=DEFAULT_LOOKUP_URL)
+    st.caption(f"Using repository file: {DEFAULT_LOOKUP_PATH}")
 
     st.header("Run Tag")
     run_tag = st.text_input("Optional run label", value="")
@@ -374,11 +375,13 @@ with st.sidebar:
 
 # Load lookup button
 lookup_tabs = None
-if st.button("Load lookup from GitHub"):
+if st.button("Load lookup from repository"):
     try:
-        lookup_tabs = load_lookup_from_github(lookup_url)
+        lookup_tabs = load_lookup_from_file(DEFAULT_LOOKUP_PATH)
         st.session_state["lookup_tabs"] = lookup_tabs
         st.success("Lookup tabs loaded.")
+    except FileNotFoundError:
+        st.error(f"Lookup file not found at: {DEFAULT_LOOKUP_PATH}")
     except Exception as e:
         st.error(f"Failed to load lookup: {e}")
 
@@ -429,7 +432,7 @@ run = st.button("Run mapping + update lookup", type="primary")
 
 if run:
     if lookup_tabs is None:
-        st.error("Load lookup from GitHub first.")
+        st.error("Load lookup from the repository file first.")
     elif raw_df is None:
         st.error("Upload your raw data first.")
     else:
@@ -550,7 +553,7 @@ else:
 
 st.caption(
     """
-You will manually commit the updated lookup Excel back to GitHub.
-This app reads from GitHub RAW and generates an updated workbook for download.
+The app reads the repository copy of lookup_.xlsx and generates an updated
+workbook for download. Commit the updated file back to your repo as needed.
 """
 )
