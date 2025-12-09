@@ -511,7 +511,7 @@ if run:
             m2.metric("Rows valid for ANY level", int(issues["Any_Level_Valid"].sum()))
 
             st.subheader("Enriched data preview (all rows)")
-            st.dataframe(enriched.head(100), use_container_width=True)
+            st.dataframe(enriched.head(80000), use_container_width=True)
 
             st.subheader("Validity by level (first 50 rows)")
             st.dataframe(issues.head(50), use_container_width=True)
