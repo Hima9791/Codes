@@ -112,6 +112,40 @@ META_COLS = ["RowFlag", "RowDate", "RunTag"]
 # 3) Strict rejection settings
 # ----------------------------
 BAD_TOKENS = {"N/A"}  # literal token
+def apply_normalized_columns_to_tab(tab_df: pd.DataFrame, level_key: str):
+    if level_key not in {"Family", "Die"}:
+        return tab_df
+
+    info = LEVEL_TABS[level_key]
+    i_col = info["id_col"]  # raw ID col
+
+    if level_key == "Family":
+        s_norm = "Family String_Normalized"
+        i_norm = "Family ID_Normalized"
+
+        # Build normalized string from the tab's component cols
+        tab_df[s_norm] = (
+            tab_df[COL_BV].map(safe_str) + "|" +
+            tab_df[COL_IC].map(safe_str) + "|" +
+            tab_df[COL_VCS].map(strip_after_at)
+        ).str.strip("|")
+
+    else:  # Die
+        s_norm = "Die String_Normalized"
+        i_norm = "Die ID_Normalized"
+
+        tab_df[s_norm] = tab_df[COL_HFE].map(strip_after_at)
+
+    # Map each normalized string -> least RAW ID
+    norm_map = (
+        tab_df[tab_df[s_norm].map(safe_str) != ""]
+        .groupby(s_norm)[i_col]
+        .apply(min_id)
+        .to_dict()
+    )
+
+    tab_df[i_norm] = tab_df[s_norm].map(norm_map).fillna("")
+    return tab_df
 
 def is_blank_or_na(x):
     s = str(x).strip()
@@ -218,8 +252,15 @@ def ensure_tab_columns(df: pd.DataFrame, level_key: str):
     i_col = info["id_col"]
     comps = info["components"]
 
-    # Ensure core cols
-    for c in comps + [s_col, i_col] + META_COLS:
+    # Extra normalized cols only for Family/Die
+    extra = []
+    if level_key == "Family":
+        extra = ["Family String_Normalized", "Family ID_Normalized"]
+    elif level_key == "Die":
+        extra = ["Die String_Normalized", "Die ID_Normalized"]
+
+    # Ensure core + extra cols exist
+    for c in comps + [s_col, i_col] + extra + META_COLS:
         if c not in df.columns:
             df[c] = ""
 
@@ -227,12 +268,13 @@ def ensure_tab_columns(df: pd.DataFrame, level_key: str):
     df["RowFlag"] = df["RowFlag"].apply(safe_str)
     df["RowDate"] = df["RowDate"].apply(safe_str)
     df["RunTag"]  = df["RunTag"].apply(safe_str)
-
     df.loc[df["RowFlag"] == "", "RowFlag"] = "original"
 
     # Final column order
-    df = df[comps + [s_col, i_col] + META_COLS].copy()
+    ordered = comps + [s_col, i_col] + extra + META_COLS
+    df = df[ordered].copy()
     return df
+
 
 def build_strings_from_input(df: pd.DataFrame):
     out = df.copy()
@@ -293,45 +335,29 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
                          level_key: str, run_tag: str, prefix_override: str,
                          valid_mask: pd.Series):
     info = LEVEL_TABS[level_key]
-    s_col = info["string_col"]
-    i_col = info["id_col"]
+    s_col = info["string_col"]   # RAW string col name
+    i_col = info["id_col"]       # RAW ID col name
     comps = info["components"]
     default_prefix = prefix_override or info["prefix_default"]
 
-    # Ensure lookup tab schema
+    # Ensure lookup tab schema (now keeps extra normalized cols for Family/Die)
     tab_df = ensure_tab_columns(tab_df, level_key)
 
-    # Normalize existing lookup
+    # Normalize existing lookup RAW
     tab_df[s_col] = tab_df[s_col].apply(safe_str)
     tab_df[i_col] = tab_df[i_col].apply(safe_str)
+    for c in comps:
+        if c in tab_df.columns:
+            tab_df[c] = tab_df[c].apply(safe_str)
 
     existing = tab_df[tab_df[s_col] != ""].copy()
+    mapping_raw = dict(zip(existing[s_col], existing[i_col]))
 
-    # Build normalized string for existing lookup
-    if level_key == "Family":
-        existing["_NormString"] = (
-            existing[COL_BV].map(safe_str) + "|" +
-            existing[COL_IC].map(safe_str) + "|" +
-            existing[COL_VCS].map(strip_after_at)
-        ).str.strip("|")
-    elif level_key == "Die":
-        existing["_NormString"] = existing[COL_HFE].map(strip_after_at)
-    else:
-        existing["_NormString"] = existing[s_col].map(safe_str)
-
-    # Collapse by normalized string and pick least ID
-    mapping = (
-        existing[existing["_NormString"] != ""]
-        .groupby("_NormString")[i_col]
-        .apply(min_id)
-        .to_dict()
-    )
-
-    # Infer ID format from existing IDs
+    # Infer RAW ID format
     prefix, next_num, width = infer_id_format(existing[i_col], default_prefix)
 
     # ---------------------------------------
-    # Build DISTINCT RELATIONS from VALID rows only
+    # PASS 1) RAW DISTINCT RELATIONS (VALID rows only)
     # ---------------------------------------
     rel_cols = comps + [s_col]
     rel_df = enriched.loc[valid_mask, rel_cols].copy()
@@ -340,25 +366,10 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
         rel_df[c] = rel_df[c].apply(safe_str)
     rel_df[s_col] = rel_df[s_col].apply(safe_str)
 
-    # Build normalized string for incoming relations
-    if level_key == "Family":
-        rel_df["_NormString"] = (
-            rel_df[COL_BV].map(safe_str) + "|" +
-            rel_df[COL_IC].map(safe_str) + "|" +
-            rel_df[COL_VCS].map(strip_after_at)
-        ).str.strip("|")
-    elif level_key == "Die":
-        rel_df["_NormString"] = rel_df[COL_HFE].map(strip_after_at)
-    else:
-        rel_df["_NormString"] = rel_df[s_col].map(safe_str)
+    rel_df = rel_df[rel_df[s_col] != ""].copy()
+    rel_df = rel_df.drop_duplicates(subset=rel_cols, keep="first").reset_index(drop=True)
 
-    rel_df = rel_df[rel_df["_NormString"] != ""].copy()
-    rel_df = rel_df.drop_duplicates(subset=["_NormString"], keep="first").reset_index(drop=True)
-
-    new_rel = rel_df[~rel_df["_NormString"].isin(mapping.keys())].copy()
-
-    # Store normalized string in lookup
-    new_rel[s_col] = new_rel["_NormString"]
+    new_rel = rel_df[~rel_df[s_col].isin(mapping_raw.keys())].copy()
 
     new_rows = []
     if not new_rel.empty:
@@ -369,9 +380,9 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
 
         new_rel[i_col] = new_ids
 
-        # Update mapping
+        # Update RAW mapping
         for s, new_id in zip(new_rel[s_col].tolist(), new_rel[i_col].tolist()):
-            mapping[s] = new_id
+            mapping_raw[s] = new_id
 
         # Build new lookup rows with original comps
         for _, r in new_rel.iterrows():
@@ -389,32 +400,47 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
         tab_df = pd.concat([tab_df, pd.DataFrame(new_rows)], ignore_index=True)
 
     # ---------------------------------------
-    # Map IDs back to ALL rows:
-    # - If a row is invalid for this level => blank ID
+    # Map RAW IDs back to enriched
     # ---------------------------------------
     enriched[i_col] = ""
-    enriched[f"{i_col}_Normalized"] = ""
+    valid_strings = enriched.loc[valid_mask, s_col].apply(safe_str)
+    enriched.loc[valid_mask, i_col] = valid_strings.map(mapping_raw).fillna("")
 
-    if level_key == "Family":
-        norm_series = enriched["Family String_Normalized"].map(safe_str)
-        enriched["Family String_Normalized"] = norm_series
-        enriched.loc[valid_mask, f"{i_col}_Normalized"] = norm_series.loc[valid_mask].map(mapping).fillna("")
-        enriched.loc[valid_mask, i_col] = enriched.loc[valid_mask, f"{i_col}_Normalized"]
+    # ---------------------------------------
+    # PASS 2) NORMALIZED (Family/Die only)
+    # - add 2 new cols in tab + enriched
+    # - normalized ID = least RAW ID per normalized string
+    # ---------------------------------------
+    if level_key in {"Family", "Die"}:
+        tab_df = apply_normalized_columns_to_tab(tab_df, level_key)
 
-    elif level_key == "Die":
-        norm_series = enriched["Die String_Normalized"].map(safe_str)
-        enriched["Die String_Normalized"] = norm_series
-        enriched.loc[valid_mask, f"{i_col}_Normalized"] = norm_series.loc[valid_mask].map(mapping).fillna("")
-        enriched.loc[valid_mask, i_col] = enriched.loc[valid_mask, f"{i_col}_Normalized"]
+        if level_key == "Family":
+            s_norm = "Family String_Normalized"
+            i_norm = "Family ID_Normalized"
+        else:
+            s_norm = "Die String_Normalized"
+            i_norm = "Die ID_Normalized"
 
-    else:
-        valid_strings = enriched.loc[valid_mask, s_col].apply(safe_str)
-        enriched.loc[valid_mask, i_col] = valid_strings.map(mapping).fillna("")
+        # Build norm_map from UPDATED tab
+        norm_map = (
+            tab_df[tab_df[s_norm].map(safe_str) != ""]
+            .groupby(s_norm)[i_col]
+            .apply(min_id)
+            .to_dict()
+        )
 
-    if "_NormString" in tab_df.columns:
-        tab_df = tab_df.drop(columns=["_NormString"])
+        # Ensure enriched cols exist
+        if s_norm not in enriched.columns:
+            # should already exist from build_strings_from_input
+            enriched[s_norm] = ""
+        enriched[i_norm] = ""
+
+        norm_series = enriched[s_norm].map(safe_str)
+        enriched[s_norm] = norm_series
+        enriched.loc[valid_mask, i_norm] = norm_series.loc[valid_mask].map(norm_map).fillna("")
 
     return enriched, tab_df, prefix, width, len(new_rows)
+
 
 
 def reorder_enriched_cols(df: pd.DataFrame):
