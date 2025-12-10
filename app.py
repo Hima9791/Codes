@@ -145,6 +145,26 @@ def safe_str(x):
         return ""
     return str(x).strip()
 
+
+def strip_after_at(x):
+    s = safe_str(x)
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    return s.strip()
+
+
+def id_sort_key(v: str):
+    v = safe_str(v)
+    p, n, _w = extract_prefix_and_num(v)
+    return (p or "", n if n is not None else 10 ** 12, v)
+
+
+def min_id(series: pd.Series):
+    vals = [safe_str(x) for x in series.tolist() if safe_str(x)]
+    if not vals:
+        return ""
+    return sorted(vals, key=id_sort_key)[0]
+
 def normalize_pack_qty(x):
     if pd.isna(x):
         return ""
@@ -217,30 +237,50 @@ def ensure_tab_columns(df: pd.DataFrame, level_key: str):
 def build_strings_from_input(df: pd.DataFrame):
     out = df.copy()
 
+    # --- normalized raw feature values
+    out[f"{COL_VCS}_Normalized"] = out[COL_VCS].map(strip_after_at)
+    out[f"{COL_HFE}_Normalized"] = out[COL_HFE].map(strip_after_at)
+
+    # --- Generic
     out["Generic String"] = (
         out[COL_TRANSISTOR_TYPE].map(safe_str) + "|" +
         out[COL_CONFIGURATION].map(safe_str)
     ).str.strip("|")
 
+    # --- Family RAW
     out["Family String"] = (
         out[COL_BV].map(safe_str) + "|" +
         out[COL_IC].map(safe_str) + "|" +
         out[COL_VCS].map(safe_str)
     ).str.strip("|")
 
+    # --- Family NORMALIZED
+    out["Family String_Normalized"] = (
+        out[COL_BV].map(safe_str) + "|" +
+        out[COL_IC].map(safe_str) + "|" +
+        out[f"{COL_VCS}_Normalized"].map(safe_str)
+    ).str.strip("|")
+
+    # --- Die RAW
     out["Die String"] = out[COL_HFE].map(safe_str)
 
+    # --- Die NORMALIZED
+    out["Die String_Normalized"] = out[f"{COL_HFE}_Normalized"].map(safe_str)
+
+    # --- Package
     out["Package String"] = (
         out[COL_PKG].map(safe_str) + "|" +
         out[COL_PIN].map(safe_str) + "|" +
         out[COL_PMAX].map(safe_str)
     ).str.strip("|")
 
+    # --- Option
     out["Option String"] = (
         out[COL_TEMP].map(safe_str) + "|" +
         out[COL_ROHS].map(safe_str)
     ).str.strip("|")
 
+    # --- Packing
     out["Packing String"] = (
         out[COL_PACK_TYPE].map(safe_str) + "|" +
         out[COL_PACK_QTY].map(normalize_pack_qty) + "|" +
@@ -267,8 +307,25 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
 
     existing = tab_df[tab_df[s_col] != ""].copy()
 
-    # Mapping from existing lookup
-    mapping = dict(zip(existing[s_col], existing[i_col]))
+    # Build normalized string for existing lookup
+    if level_key == "Family":
+        existing["_NormString"] = (
+            existing[COL_BV].map(safe_str) + "|" +
+            existing[COL_IC].map(safe_str) + "|" +
+            existing[COL_VCS].map(strip_after_at)
+        ).str.strip("|")
+    elif level_key == "Die":
+        existing["_NormString"] = existing[COL_HFE].map(strip_after_at)
+    else:
+        existing["_NormString"] = existing[s_col].map(safe_str)
+
+    # Collapse by normalized string and pick least ID
+    mapping = (
+        existing[existing["_NormString"] != ""]
+        .groupby("_NormString")[i_col]
+        .apply(min_id)
+        .to_dict()
+    )
 
     # Infer ID format from existing IDs
     prefix, next_num, width = infer_id_format(existing[i_col], default_prefix)
@@ -283,11 +340,25 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
         rel_df[c] = rel_df[c].apply(safe_str)
     rel_df[s_col] = rel_df[s_col].apply(safe_str)
 
-    rel_df = rel_df[rel_df[s_col] != ""].copy()
-    rel_df = rel_df.drop_duplicates(subset=rel_cols, keep="first").reset_index(drop=True)
+    # Build normalized string for incoming relations
+    if level_key == "Family":
+        rel_df["_NormString"] = (
+            rel_df[COL_BV].map(safe_str) + "|" +
+            rel_df[COL_IC].map(safe_str) + "|" +
+            rel_df[COL_VCS].map(strip_after_at)
+        ).str.strip("|")
+    elif level_key == "Die":
+        rel_df["_NormString"] = rel_df[COL_HFE].map(strip_after_at)
+    else:
+        rel_df["_NormString"] = rel_df[s_col].map(safe_str)
 
-    # Find new strings
-    new_rel = rel_df[~rel_df[s_col].isin(mapping.keys())].copy()
+    rel_df = rel_df[rel_df["_NormString"] != ""].copy()
+    rel_df = rel_df.drop_duplicates(subset=["_NormString"], keep="first").reset_index(drop=True)
+
+    new_rel = rel_df[~rel_df["_NormString"].isin(mapping.keys())].copy()
+
+    # Store normalized string in lookup
+    new_rel[s_col] = new_rel["_NormString"]
 
     new_rows = []
     if not new_rel.empty:
@@ -322,10 +393,43 @@ def assign_ids_for_level(enriched: pd.DataFrame, tab_df: pd.DataFrame,
     # - If a row is invalid for this level => blank ID
     # ---------------------------------------
     enriched[i_col] = ""
-    valid_strings = enriched.loc[valid_mask, s_col].apply(safe_str)
-    enriched.loc[valid_mask, i_col] = valid_strings.map(mapping).fillna("")
+    enriched[f"{i_col}_Normalized"] = ""
+
+    if level_key == "Family":
+        norm_series = enriched["Family String_Normalized"].map(safe_str)
+        enriched["Family String_Normalized"] = norm_series
+        enriched.loc[valid_mask, f"{i_col}_Normalized"] = norm_series.loc[valid_mask].map(mapping).fillna("")
+        enriched.loc[valid_mask, i_col] = enriched.loc[valid_mask, f"{i_col}_Normalized"]
+
+    elif level_key == "Die":
+        norm_series = enriched["Die String_Normalized"].map(safe_str)
+        enriched["Die String_Normalized"] = norm_series
+        enriched.loc[valid_mask, f"{i_col}_Normalized"] = norm_series.loc[valid_mask].map(mapping).fillna("")
+        enriched.loc[valid_mask, i_col] = enriched.loc[valid_mask, f"{i_col}_Normalized"]
+
+    else:
+        valid_strings = enriched.loc[valid_mask, s_col].apply(safe_str)
+        enriched.loc[valid_mask, i_col] = valid_strings.map(mapping).fillna("")
+
+    if "_NormString" in tab_df.columns:
+        tab_df = tab_df.drop(columns=["_NormString"])
 
     return enriched, tab_df, prefix, width, len(new_rows)
+
+
+def reorder_enriched_cols(df: pd.DataFrame):
+    preferred = []
+    for base in ["Generic", "Family", "Die", "Package", "Option", "Packing"]:
+        s = f"{base} String"
+        sn = f"{base} String_Normalized"
+        i = f"{base} ID"
+        inn = f"{base} ID_Normalized"
+        for c in [s, sn, i, inn]:
+            if c in df.columns:
+                preferred.append(c)
+
+    rest = [c for c in df.columns if c not in preferred]
+    return df[rest[:0] + preferred + rest]
 
 
 def to_excel_bytes_with_tabs(enriched_df, rejected_df, tabs_dict):
@@ -500,6 +604,7 @@ if run:
                 )
 
             # Store results
+            enriched = reorder_enriched_cols(enriched)
             st.session_state["enriched_df"] = enriched
             st.session_state["updated_tabs"] = updated_tabs
 
