@@ -471,6 +471,19 @@ def to_excel_bytes_with_tabs(enriched_df, rejected_df, tabs_dict):
     bio.seek(0)
     return bio.getvalue()
 
+
+def build_partid_codes(enriched_df: pd.DataFrame):
+    if "PartID" not in enriched_df.columns:
+        return None
+
+    cols = ["PartID"]
+    id_cols = [info["id_col"] for info in LEVEL_TABS.values()]
+    cols.extend([c for c in id_cols if c in enriched_df.columns])
+
+    partid_df = enriched_df[cols].copy()
+    partid_df = partid_df.drop_duplicates().reset_index(drop=True)
+    return partid_df
+
 def load_lookup_from_file(path: str):
     with open(path, "rb") as f:
         content = f.read()
@@ -633,6 +646,7 @@ if run:
             enriched = reorder_enriched_cols(enriched)
             st.session_state["enriched_df"] = enriched
             st.session_state["updated_tabs"] = updated_tabs
+            st.session_state["partid_codes"] = build_partid_codes(enriched)
 
             st.success("Mapping complete.")
 
@@ -667,6 +681,7 @@ st.divider()
 enriched = st.session_state.get("enriched_df")
 updated_tabs = st.session_state.get("updated_tabs")
 rejected = st.session_state.get("rejected_rows", pd.DataFrame())
+partid_codes = st.session_state.get("partid_codes")
 
 if enriched is not None and updated_tabs is not None:
     # Excel bundle containing updated lookup tabs + enriched + rejected
@@ -704,6 +719,16 @@ if enriched is not None and updated_tabs is not None:
                 file_name=f"{level_key.lower()}_lookup.csv",
                 mime="text/csv"
             )
+
+    if partid_codes is not None:
+        st.download_button(
+            "Download PartID codes (CSV)",
+            data=partid_codes.to_csv(index=False).encode("utf-8-sig"),
+            file_name="partid_codes.csv",
+            mime="text/csv"
+        )
+    else:
+        st.caption("Add a PartID column to your input to enable PartID-level codes export.")
 else:
     st.info("Run mapping to enable downloads.")
 
