@@ -127,14 +127,14 @@ def apply_normalized_columns_to_tab(tab_df: pd.DataFrame, level_key: str):
         tab_df[s_norm] = (
             tab_df[COL_BV].map(safe_str) + "|" +
             tab_df[COL_IC].map(safe_str) + "|" +
-            tab_df[COL_VCS].map(strip_after_at)
+            tab_df[COL_VCS].map(normalize_vcs_multi)
         ).str.strip("|")
 
     else:  # Die
         s_norm = "Die String_Normalized"
         i_norm = "Die ID_Normalized"
 
-        tab_df[s_norm] = tab_df[COL_HFE].map(strip_after_at)
+        tab_df[s_norm] = tab_df[COL_HFE].map(normalize_hfe_multi)
 
     # Map each normalized string -> least RAW ID
     norm_map = (
@@ -185,6 +185,110 @@ def strip_after_at(x):
     if "@" in s:
         s = s.split("@", 1)[0]
     return s.strip()
+
+
+def extract_sorted_unique(tokens, key_cast=float):
+    """Sort unique tokens using key_cast and join with '|'."""
+    cleaned = {safe_str(t).strip() for t in tokens if safe_str(t).strip() != ""}
+    return "|".join(sorted(cleaned, key=key_cast))
+
+
+def _volt_key(tok: str) -> float:
+    """
+    Convert '500mV', '1.2 V', '0.5µV', '1kV', '2MV' to a numeric value in VOLTS
+    for proper sorting.
+    Supports prefixes: f, p, n, u/µ/μ, m, (none), k/K, M, G, T.
+    """
+    s = safe_str(tok)
+    if not s:
+        return 0.0
+
+    # Remove spaces: '500 mV' -> '500mV'
+    s_clean = re.sub(r'\s+', '', s)
+
+    # number + optional 1-char prefix + V/v
+    m = re.match(r'(\d+(?:\.\d+)?)([fpnumkKMGTµμu]?)[vV]$', s_clean)
+    if not m:
+        # Fallback: 1st number only
+        m2 = re.search(r'\d+(?:\.\d+)?', s_clean)
+        return float(m2.group(0)) if m2 else 0.0
+
+    val = float(m.group(1))
+    prefix = m.group(2) or ""
+
+    factor_map = {
+        "":  1.0,
+        "f": 1e-15,
+        "p": 1e-12,
+        "n": 1e-9,
+        "u": 1e-6,
+        "µ": 1e-6,
+        "μ": 1e-6,
+        "m": 1e-3,
+        "k": 1e3,
+        "K": 1e3,
+        "M": 1e6,
+        "G": 1e9,
+        "T": 1e12,
+    }
+
+    factor = factor_map.get(prefix, 1.0)
+    return val * factor
+
+
+def normalize_vcs_multi(x):
+    """
+    Extract ALL voltage values (with any SI prefix) from VCE(sat) cells.
+
+    Example:
+        '1.1V @ 400mA, 4A, 500 mV @ 100mA, 1kV @ 10mA'
+    ->  '500mV|1.1V|1kV'
+    """
+    s = safe_str(x)
+    if not s:
+        return ""
+
+    # Prefer values right before '@'
+    pattern_before_at = r'(\d+(?:\.\d+)?\s*(?:[fpnumkKMGTµμu]?V))\s*@'
+    matches = re.findall(pattern_before_at, s, flags=re.IGNORECASE)
+
+    # If nothing with '@', take all voltage-like tokens
+    if not matches:
+        pattern_anywhere = r'(\d+(?:\.\d+)?\s*(?:[fpnumkKMGTµμu]?V))'
+        matches = re.findall(pattern_anywhere, s, flags=re.IGNORECASE)
+
+    if matches:
+        # Remove internal spaces to canonicalize
+        tokens = [re.sub(r'\s+', '', m).strip() for m in matches]
+        return extract_sorted_unique(tokens, key_cast=_volt_key)
+
+    # Fallback: legacy “take only before @”
+    return strip_after_at(s).strip()
+
+
+def normalize_hfe_multi(x):
+    """
+    Extract ALL gain values from HFE cells.
+
+    Example:
+        '300 @ 1A, 2V , 180 @ 1A, 2V'
+    ->  '180|300'
+    """
+    s = safe_str(x)
+    if not s:
+        return ""
+
+    # Prefer numbers before '@'
+    matches = re.findall(r'(\d+(?:\.\d+)?)\s*@', s)
+    if not matches:
+        # Otherwise, all numbers
+        matches = re.findall(r'(\d+(?:\.\d+)?)', s)
+
+    if matches:
+        tokens = [m.strip() for m in matches]
+        return extract_sorted_unique(tokens, key_cast=float)
+
+    return strip_after_at(s).strip()
 
 
 def id_sort_key(v: str):
@@ -279,9 +383,9 @@ def ensure_tab_columns(df: pd.DataFrame, level_key: str):
 def build_strings_from_input(df: pd.DataFrame):
     out = df.copy()
 
-    # --- normalized raw feature values
-    out[f"{COL_VCS}_Normalized"] = out[COL_VCS].map(strip_after_at)
-    out[f"{COL_HFE}_Normalized"] = out[COL_HFE].map(strip_after_at)
+    # --- normalized raw feature values (multi-value aware)
+    out[f"{COL_VCS}_Normalized"] = out[COL_VCS].map(normalize_vcs_multi)
+    out[f"{COL_HFE}_Normalized"] = out[COL_HFE].map(normalize_hfe_multi)
 
     # --- Generic
     out["Generic String"] = (
